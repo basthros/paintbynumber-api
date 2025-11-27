@@ -531,30 +531,55 @@ async def generate_paint_by_number(
 # Serve React Static Files
 # Check if dist folder exists (production)
 dist_path = Path(__file__).parent / "dist"
-if dist_path.exists():
-    # Mount static assets
-    app.mount("/assets", StaticFiles(directory=str(dist_path / "assets")), name="assets")
+
+# Only set up static file serving if dist exists
+if dist_path.exists() and dist_path.is_dir():
+    print(f"Serving static files from: {dist_path}")
     
-    # Serve index.html for root and all non-API routes
+    # Mount static assets FIRST
+    if (dist_path / "assets").exists():
+        app.mount("/assets", StaticFiles(directory=str(dist_path / "assets")), name="assets")
+    
+    # Serve specific files
+    @app.get("/vite.svg")
+    async def serve_vite_svg():
+        svg_path = dist_path / "vite.svg"
+        if svg_path.exists():
+            return FileResponse(str(svg_path))
+        raise HTTPException(status_code=404)
+    
+    @app.get("/favicon.ico")
+    async def serve_favicon():
+        favicon_path = dist_path / "favicon.ico"
+        if favicon_path.exists():
+            return FileResponse(str(favicon_path))
+        raise HTTPException(status_code=404)
+    
+    # Serve root
     @app.get("/")
     async def serve_root():
         """Serve React app"""
         return FileResponse(str(dist_path / "index.html"))
     
-    @app.get("/{full_path:path}")
-    async def serve_react_app(full_path: str):
-        """Catch-all route to serve React app for client-side routing"""
-        # Don't serve index.html for API routes
-        if full_path.startswith("api/"):
-            raise HTTPException(status_code=404, detail="Not found")
+    # Catch-all for client-side routing (MUST BE LAST)
+    # This will NOT catch /api/* routes because those are already defined above
+    @app.get("/{catchall:path}")
+    async def serve_spa(catchall: str):
+        """Serve React SPA for client-side routing"""
+        # Explicitly reject API routes (shouldn't reach here, but just in case)
+        if catchall.startswith("api"):
+            raise HTTPException(status_code=404, detail="API endpoint not found")
         
-        # Check if file exists in dist
-        file_path = dist_path / full_path
+        # Try to serve static file if it exists
+        file_path = dist_path / catchall
         if file_path.exists() and file_path.is_file():
             return FileResponse(str(file_path))
         
         # Otherwise serve index.html for React Router
         return FileResponse(str(dist_path / "index.html"))
+else:
+    print(f"Warning: dist folder not found at {dist_path}")
+
 
 
 if __name__ == "__main__":
