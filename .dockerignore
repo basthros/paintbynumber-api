@@ -1,0 +1,11 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+dist/
+node_modules/
+.git
+.gitignore
+build.sh
