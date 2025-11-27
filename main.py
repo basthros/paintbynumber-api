@@ -1,6 +1,7 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 import cv2
 import numpy as np
 from scipy.spatial import cKDTree
@@ -11,20 +12,18 @@ from typing import List, Dict
 import io
 from PIL import Image, ImageDraw, ImageFont
 import os
+from pathlib import Path
 
 app = FastAPI(title="Paint by Number API", version="1.0.0")
 
 # CORS configuration for Capacitor mobile apps
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",")
 
 if ENVIRONMENT == "development":
     origins = ["*"]
 else:
-    # Add your Render.com frontend URL
     origins = [
-        "https://paint-by-number-frontend-wihy.onrender.com",
-        *[o for o in ALLOWED_ORIGINS if o],  # Additional origins from env var
+        "*",  # Allow all for combined service
         "capacitor://localhost",  # iOS
         "http://localhost",        # Android
         "ionic://localhost",       # Alternative format
@@ -428,8 +427,9 @@ def encode_image_to_base64(img: np.ndarray, format: str = 'jpeg') -> str:
     return f"data:image/{format};base64,{img_base64}"
 
 
-@app.get("/")
-async def root():
+# API Routes
+@app.get("/api/health")
+async def health_check():
     """Health check endpoint."""
     return {
         "status": "online",
@@ -438,7 +438,7 @@ async def root():
     }
 
 
-@app.post("/generate")
+@app.post("/api/generate")
 async def generate_paint_by_number(
     file: UploadFile = File(...),
     palette: str = Form(...),
@@ -526,6 +526,35 @@ async def generate_paint_by_number(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Processing error: {str(e)}"
         )
+
+
+# Serve React Static Files
+# Check if dist folder exists (production)
+dist_path = Path(__file__).parent / "dist"
+if dist_path.exists():
+    # Mount static assets
+    app.mount("/assets", StaticFiles(directory=str(dist_path / "assets")), name="assets")
+    
+    # Serve index.html for root and all non-API routes
+    @app.get("/")
+    async def serve_root():
+        """Serve React app"""
+        return FileResponse(str(dist_path / "index.html"))
+    
+    @app.get("/{full_path:path}")
+    async def serve_react_app(full_path: str):
+        """Catch-all route to serve React app for client-side routing"""
+        # Don't serve index.html for API routes
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not found")
+        
+        # Check if file exists in dist
+        file_path = dist_path / full_path
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(str(file_path))
+        
+        # Otherwise serve index.html for React Router
+        return FileResponse(str(dist_path / "index.html"))
 
 
 if __name__ == "__main__":
