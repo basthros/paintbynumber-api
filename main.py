@@ -302,6 +302,26 @@ async def generate_paint_by_number(
             detail=f"Processing error: {str(e)}"
         )
 
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pathlib import Path
+
+# Serve static files (React app)
+static_dir = Path(__file__).parent / "dist"
+if static_dir.exists():
+    # Serve static assets
+    app.mount("/assets", StaticFiles(directory=str(static_dir / "assets")), name="assets")
+    
+    # Catch-all route for React Router (must be AFTER all API routes)
+    @app.get("/{full_path:path}")
+    async def serve_react_app(full_path: str):
+        """Serve React app for all non-API routes."""
+        file_path = static_dir / full_path
+        if file_path.is_file():
+            return FileResponse(file_path)
+        # For React Router, return index.html
+        return FileResponse(static_dir / "index.html")
+
 
 if __name__ == "__main__":
     import uvicorn
