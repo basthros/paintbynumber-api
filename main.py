@@ -1,6 +1,7 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse  # ADD FileResponse here
+from fastapi.staticfiles import StaticFiles  # ADD this line
 import cv2
 import numpy as np
 from scipy.spatial import cKDTree
@@ -11,6 +12,7 @@ from typing import List, Dict
 import io
 from PIL import Image, ImageDraw, ImageFont
 import os
+from pathlib import Path 
 
 app = FastAPI(title="Paint by Number API", version="1.0.0")
 
