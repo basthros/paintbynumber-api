@@ -1,7 +1,6 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 import cv2
 import numpy as np
 from scipy.spatial import cKDTree
@@ -12,7 +11,6 @@ from typing import List, Dict
 import io
 from PIL import Image, ImageDraw, ImageFont
 import os
-from pathlib import Path
 
 app = FastAPI(title="Paint by Number API", version="1.0.0")
 
@@ -23,7 +21,7 @@ if ENVIRONMENT == "development":
     origins = ["*"]
 else:
     origins = [
-        "*",  # Allow all for combined service
+        "https://yourdomain.com",
         "capacitor://localhost",  # iOS
         "http://localhost",        # Android
         "ionic://localhost",       # Alternative format
@@ -170,39 +168,188 @@ def auto_canny(image: np.ndarray, sigma: float = 0.33) -> np.ndarray:
     return edges
 
 
-def find_region_label_position(mask: np.ndarray) -> tuple:
+def pole_of_inaccessibility(mask: np.ndarray, precision: float = 1.0) -> tuple:
     """
-    Find optimal position for placing a label in a region.
-    Uses centroid with fallback to ensure position is within region.
+    Find the pole of inaccessibility - the point inside a region that is
+    farthest from any edge. This is the optimal position for placing text.
+
+    Based on the polylabel algorithm by Mapbox.
     """
-    # Find all points in the region
-    points = np.column_stack(np.where(mask > 0))
+    from scipy.ndimage import distance_transform_edt
 
-    if len(points) == 0:
-        return None
+    # Use distance transform to find point farthest from edges
+    # This is faster than the full polylabel algorithm and works well for our use case
+    distance_map = distance_transform_edt(mask)
 
-    # Calculate centroid
-    centroid_y, centroid_x = points.mean(axis=0).astype(int)
+    # Find the point with maximum distance
+    max_dist_idx = np.unravel_index(np.argmax(distance_map), distance_map.shape)
 
-    # Verify centroid is within region
-    if mask[centroid_y, centroid_x]:
-        return (centroid_x, centroid_y)
-
-    # Fallback: use the first point in the region
-    return (points[0, 1], points[0, 0])
+    # Return as (x, y) coordinates
+    return (max_dist_idx[1], max_dist_idx[0])
 
 
-def calculate_font_scale(region_area: int, base_scale: float = 0.6) -> tuple:
+def calculate_adaptive_font_scale(region_area: int, text_length: int = 1) -> tuple:
     """
-    Calculate font scale and thickness based on region size.
-    Returns (font_scale, thickness)
+    Calculate font scale adaptively based on region size and text length.
+    Returns (font_scale, thickness, should_place)
     """
-    # Scale font with square root of area
-    scale_factor = np.sqrt(region_area / 500)  # 500 is reference area
-    font_scale = max(0.3, min(base_scale * scale_factor, 1.2))
-    thickness = max(1, int(font_scale * 2))
+    # Minimum area required for text placement
+    min_area_per_char = 100  # pixels per character
+    required_area = min_area_per_char * text_length
 
-    return (font_scale, thickness)
+    if region_area < required_area:
+        # Region too small for reliable text placement
+        return (0, 0, False)
+
+    # Calculate base font scale from area
+    # Use cube root for more gradual scaling
+    scale_factor = np.power(region_area / 500, 0.35)
+
+    # Adjust for text length
+    length_penalty = 1.0 / (1.0 + (text_length - 1) * 0.15)
+
+    font_scale = max(0.25, min(scale_factor * length_penalty * 0.5, 0.9))
+    thickness = max(1, int(font_scale * 2.5))
+
+    return (font_scale, thickness, True)
+
+
+def text_fits_in_region(mask: np.ndarray, pos: tuple, text: str,
+                        font_scale: float, thickness: int) -> bool:
+    """
+    Check if text will fit inside the region without going outside or
+    overlapping boundaries too much.
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (text_width, text_height), baseline = cv2.getTextSize(
+        text, font, font_scale, thickness
+    )
+
+    # Create a buffer zone around the text
+    buffer = 4
+    text_bbox_width = text_width + buffer * 2
+    text_bbox_height = text_height + baseline + buffer * 2
+
+    # Check if the bounding box fits within the region
+    x, y = pos
+    half_width = text_bbox_width // 2
+    half_height = text_bbox_height // 2
+
+    # Extract region around text position
+    y_min = max(0, y - half_height)
+    y_max = min(mask.shape[0], y + half_height)
+    x_min = max(0, x - half_width)
+    x_max = min(mask.shape[1], x + half_width)
+
+    if y_max <= y_min or x_max <= x_min:
+        return False
+
+    region_crop = mask[y_min:y_max, x_min:x_max]
+
+    # At least 80% of the text bounding box should be inside the region
+    fill_ratio = region_crop.sum() / (region_crop.size + 1e-6)
+
+    return fill_ratio > 0.8
+
+
+def draw_outlined_text(img: np.ndarray, text: str, pos: tuple,
+                      font_scale: float, thickness: int,
+                      text_color=(0, 0, 0), outline_color=(255, 255, 255)):
+    """
+    Draw text with an outline for better visibility without background boxes.
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    # Draw outline (thicker, white)
+    outline_thickness = thickness + 2
+    cv2.putText(img, text, pos, font, font_scale, outline_color,
+                outline_thickness, cv2.LINE_AA)
+
+    # Draw main text (thinner, black)
+    cv2.putText(img, text, pos, font, font_scale, text_color,
+                thickness, cv2.LINE_AA)
+
+
+def should_add_multiple_numbers(region_area: int, region_shape: tuple) -> int:
+    """
+    Determine how many numbers should be placed in a region based on its size.
+    Returns the number of labels to place (1-3).
+    """
+    # Very small regions: 1 number
+    if region_area < 1000:
+        return 1
+
+    # Medium regions: 1 number
+    elif region_area < 3000:
+        return 1
+
+    # Large regions: potentially 2-3 numbers for easier painting
+    elif region_area < 6000:
+        return 2
+
+    else:
+        return min(3, max(2, region_area // 3000))
+
+
+def find_multiple_label_positions(mask: np.ndarray, num_labels: int) -> List[tuple]:
+    """
+    Find multiple optimal positions for placing labels in large regions.
+    Uses k-means clustering on the distance transform.
+    """
+    from scipy.ndimage import distance_transform_edt
+    from scipy.spatial.distance import cdist
+
+    if num_labels == 1:
+        return [pole_of_inaccessibility(mask)]
+
+    # Get distance transform
+    distance_map = distance_transform_edt(mask)
+
+    # Find all points with good distance from edges
+    threshold = max(3, distance_map.max() * 0.3)
+    good_points = np.column_stack(np.where(distance_map > threshold))
+
+    if len(good_points) < num_labels:
+        # Not enough good points, just return the best one
+        return [pole_of_inaccessibility(mask)]
+
+    # Sample points to reduce computation
+    if len(good_points) > 500:
+        indices = np.random.choice(len(good_points), 500, replace=False)
+        good_points = good_points[indices]
+
+    # Simple k-means clustering to spread labels out
+    # Initialize centers
+    centers_idx = np.linspace(0, len(good_points) - 1, num_labels, dtype=int)
+    centers = good_points[centers_idx]
+
+    # Run a few iterations of k-means
+    for _ in range(5):
+        # Assign points to nearest center
+        distances = cdist(good_points, centers)
+        assignments = np.argmin(distances, axis=1)
+
+        # Update centers
+        new_centers = []
+        for i in range(num_labels):
+            cluster_points = good_points[assignments == i]
+            if len(cluster_points) > 0:
+                # Weight by distance transform value
+                cluster_dist_values = distance_map[
+                    cluster_points[:, 0], cluster_points[:, 1]
+                ]
+                weights = cluster_dist_values / (cluster_dist_values.sum() + 1e-6)
+                weighted_center = np.average(cluster_points, axis=0, weights=weights)
+                new_centers.append(weighted_center.astype(int))
+            else:
+                new_centers.append(centers[i])
+
+        centers = np.array(new_centers)
+
+    # Convert to (x, y) format
+    positions = [(int(center[1]), int(center[0])) for center in centers]
+
+    return positions
 
 
 def generate_numbered_template(
@@ -211,12 +358,15 @@ def generate_numbered_template(
     palette_rgb: np.ndarray
 ) -> np.ndarray:
     """
-    Generate paint-by-number template with numbered regions and color legend.
+    Generate professional paint-by-number template with advanced algorithms.
 
-    This creates a clean black-and-white template with:
-    - Region boundaries in black
-    - Region numbers placed optimally
-    - Color legend showing number -> color mapping
+    Features:
+    - Pole of inaccessibility for optimal number placement
+    - Adaptive numbering (1-3 numbers per region based on size)
+    - Smart font sizing that guarantees fit
+    - Outlined text instead of background boxes
+    - Thin 1px boundaries
+    - Proper color legend
     """
     height, width = simplified.shape[:2]
 
@@ -229,14 +379,10 @@ def generate_numbered_template(
         rgb_tuple = tuple(color_info['rgb'])
         color_to_id[rgb_tuple] = idx + 1  # 1-indexed for user-friendliness
 
-    # Create labels image for connected components
-    # Convert RGB to single channel by creating unique ID for each color
-    simplified_flat = simplified[:, :, 0] * 65536 + simplified[:, :, 1] * 256 + simplified[:, :, 2]
+    # Track which colors are actually used
+    colors_used = set()
 
-    # Find regions for each color
-    processed_regions = set()
-    region_info = []  # Store region info for legend
-
+    # Process each color in the palette
     for palette_idx, palette_color in enumerate(palette_rgb):
         # Create mask for this specific color
         color_mask = np.all(simplified == palette_color, axis=2).astype(np.uint8)
@@ -252,79 +398,73 @@ def generate_numbered_template(
             region_mask = (labels == region_id).astype(np.uint8)
             region_area = region_mask.sum()
 
-            # Skip very small regions (less than 50 pixels)
-            if region_area < 50:
+            # Skip very small regions
+            if region_area < 80:
                 continue
 
             # Find contours for this region
-            contours, _ = cv2.findContours(region_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours, _ = cv2.findContours(
+                region_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
 
             if len(contours) == 0:
                 continue
 
-            # Draw black boundary
-            cv2.drawContours(template, contours, -1, (0, 0, 0), thickness=2)
-
-            # Find optimal label position
-            label_pos = find_region_label_position(region_mask)
-
-            if label_pos is None:
-                continue
+            # Draw thin boundary (1px)
+            cv2.drawContours(template, contours, -1, (0, 0, 0), thickness=1)
 
             # Get the palette ID for this color
             color_tuple = tuple(palette_color.tolist())
             palette_id = color_to_id.get(color_tuple, palette_idx + 1)
-
-            # Calculate font scale based on region size
-            font_scale, thickness = calculate_font_scale(region_area)
+            colors_used.add(palette_id)
 
             # Prepare text
             text = str(palette_id)
-            font = cv2.FONT_HERSHEY_SIMPLEX
 
-            # Get text size to center it
-            (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            # Determine how many numbers to place
+            num_numbers = should_add_multiple_numbers(region_area, region_mask.shape)
 
-            # Adjust position to center text
-            text_x = label_pos[0] - text_width // 2
-            text_y = label_pos[1] + text_height // 2
-
-            # Ensure text is within bounds
-            text_x = max(5, min(text_x, width - text_width - 5))
-            text_y = max(text_height + 5, min(text_y, height - 5))
-
-            # Draw white background for better visibility
-            bg_margin = 3
-            cv2.rectangle(
-                template,
-                (text_x - bg_margin, text_y - text_height - bg_margin),
-                (text_x + text_width + bg_margin, text_y + baseline + bg_margin),
-                (255, 255, 255),
-                -1
+            # Calculate adaptive font scale
+            font_scale, thickness, should_place = calculate_adaptive_font_scale(
+                region_area, len(text)
             )
 
-            # Draw number
-            cv2.putText(
-                template,
-                text,
-                (text_x, text_y),
-                font,
-                font_scale,
-                (0, 0, 0),
-                thickness,
-                cv2.LINE_AA
-            )
+            if not should_place:
+                continue
 
-            # Store region info
-            if palette_id not in [r['id'] for r in region_info]:
-                region_info.append({
-                    'id': palette_id,
-                    'color': palette_color,
-                    'used': True
-                })
+            # Find optimal position(s)
+            positions = find_multiple_label_positions(region_mask, num_numbers)
 
-    # Add color legend to the template
-    template_with_legend = add_color_legend(template, palette_data, palette_rgb)
+            # Place numbers
+            for pos in positions:
+                # Verify text fits
+                if not text_fits_in_region(region_mask, pos, text, font_scale, thickness):
+                    # Try reducing font size
+                    font_scale *= 0.7
+                    thickness = max(1, thickness - 1)
+
+                    if not text_fits_in_region(region_mask, pos, text, font_scale, thickness):
+                        continue  # Skip this position
+
+                # Calculate text position (adjust for baseline)
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                (text_width, text_height), baseline = cv2.getTextSize(
+                    text, font, font_scale, thickness
+                )
+
+                text_x = pos[0] - text_width // 2
+                text_y = pos[1] + text_height // 2
+
+                # Draw outlined text
+                draw_outlined_text(
+                    template, text, (text_x, text_y),
+                    font_scale, thickness
+                )
+
+    # Add color legend with only used colors
+    template_with_legend = add_color_legend(
+        template, palette_data, palette_rgb, colors_used
+    )
 
     return template_with_legend
 
@@ -332,16 +472,30 @@ def generate_numbered_template(
 def add_color_legend(
     template: np.ndarray,
     palette_data: List[Dict],
-    palette_rgb: np.ndarray
+    palette_rgb: np.ndarray,
+    colors_used: set = None
 ) -> np.ndarray:
     """
     Add a color legend to the bottom of the template.
-    Shows number -> color mapping for easy reference.
+    Shows number -> color mapping with CORRECT colors from palette.
+    Only shows colors that are actually used in the image.
     """
     height, width = template.shape[:2]
 
+    # Filter to only used colors if provided
+    if colors_used:
+        display_items = [(idx + 1, palette_data[idx], palette_rgb[idx])
+                        for idx in range(len(palette_data))
+                        if (idx + 1) in colors_used]
+    else:
+        display_items = [(idx + 1, palette_data[idx], palette_rgb[idx])
+                        for idx in range(len(palette_data))]
+
+    if len(display_items) == 0:
+        return template
+
     # Calculate legend dimensions
-    legend_height = min(200, max(100, len(palette_data) * 25))
+    legend_height = min(250, max(120, len(display_items) * 25))
 
     # Create expanded canvas
     canvas = np.ones((height + legend_height + 40, width, 3), dtype=np.uint8) * 255
@@ -356,51 +510,59 @@ def add_color_legend(
         "Paint-by-Number Color Guide",
         (20, title_y),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
+        0.6,
         (0, 0, 0),
         2,
         cv2.LINE_AA
     )
 
     # Calculate layout for legend items
-    items_per_row = max(1, width // 180)  # Each item needs ~180px
+    items_per_row = max(1, width // 200)  # Each item needs ~200px
 
-    for idx, (color_info, color_rgb) in enumerate(zip(palette_data, palette_rgb)):
-        row = idx // items_per_row
-        col = idx % items_per_row
+    for display_idx, (palette_id, color_info, color_rgb) in enumerate(display_items):
+        row = display_idx // items_per_row
+        col = display_idx % items_per_row
 
-        x = 20 + col * 180
-        y = title_y + 35 + row * 30
+        x = 20 + col * 200
+        y = title_y + 40 + row * 32
 
         # Ensure we don't overflow
         if y > height + legend_height + 20:
             break
 
-        # Draw color swatch
-        swatch_size = 20
+        # Draw color swatch (use exact RGB from palette)
+        swatch_size = 24
+        # Convert palette RGB to BGR for OpenCV
+        bgr_color = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
+
         cv2.rectangle(
             canvas,
             (x, y - swatch_size),
             (x + swatch_size, y),
-            tuple(int(c) for c in color_rgb.tolist()),
+            bgr_color,
             -1
         )
+        # Black border around swatch
         cv2.rectangle(
             canvas,
             (x, y - swatch_size),
             (x + swatch_size, y),
             (0, 0, 0),
-            1
+            2
         )
 
         # Draw number and note
-        text = f"{idx + 1}: {color_info.get('note', 'Color')} "
+        note_text = color_info.get('note', 'Color').strip()
+        if not note_text:
+            note_text = 'Color'
+
+        text = f"{palette_id}: {note_text[:20]}"  # Truncate long notes
         cv2.putText(
             canvas,
             text,
-            (x + swatch_size + 5, y - 5),
+            (x + swatch_size + 8, y - 8),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
+            0.45,
             (0, 0, 0),
             1,
             cv2.LINE_AA
@@ -427,9 +589,8 @@ def encode_image_to_base64(img: np.ndarray, format: str = 'jpeg') -> str:
     return f"data:image/{format};base64,{img_base64}"
 
 
-# API Routes
-@app.get("/api/health")
-async def health_check():
+@app.get("/")
+async def root():
     """Health check endpoint."""
     return {
         "status": "online",
@@ -438,7 +599,7 @@ async def health_check():
     }
 
 
-@app.post("/api/generate")
+@app.post("/generate")
 async def generate_paint_by_number(
     file: UploadFile = File(...),
     palette: str = Form(...),
@@ -526,60 +687,6 @@ async def generate_paint_by_number(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Processing error: {str(e)}"
         )
-
-
-# Serve React Static Files
-# Check if dist folder exists (production)
-dist_path = Path(__file__).parent / "dist"
-
-# Only set up static file serving if dist exists
-if dist_path.exists() and dist_path.is_dir():
-    print(f"Serving static files from: {dist_path}")
-    
-    # Mount static assets FIRST
-    if (dist_path / "assets").exists():
-        app.mount("/assets", StaticFiles(directory=str(dist_path / "assets")), name="assets")
-    
-    # Serve specific files
-    @app.get("/vite.svg")
-    async def serve_vite_svg():
-        svg_path = dist_path / "vite.svg"
-        if svg_path.exists():
-            return FileResponse(str(svg_path))
-        raise HTTPException(status_code=404)
-    
-    @app.get("/favicon.ico")
-    async def serve_favicon():
-        favicon_path = dist_path / "favicon.ico"
-        if favicon_path.exists():
-            return FileResponse(str(favicon_path))
-        raise HTTPException(status_code=404)
-    
-    # Serve root
-    @app.get("/")
-    async def serve_root():
-        """Serve React app"""
-        return FileResponse(str(dist_path / "index.html"))
-    
-    # Catch-all for client-side routing (MUST BE LAST)
-    # This will NOT catch /api/* routes because those are already defined above
-    @app.get("/{catchall:path}")
-    async def serve_spa(catchall: str):
-        """Serve React SPA for client-side routing"""
-        # Explicitly reject API routes (shouldn't reach here, but just in case)
-        if catchall.startswith("api"):
-            raise HTTPException(status_code=404, detail="API endpoint not found")
-        
-        # Try to serve static file if it exists
-        file_path = dist_path / catchall
-        if file_path.exists() and file_path.is_file():
-            return FileResponse(str(file_path))
-        
-        # Otherwise serve index.html for React Router
-        return FileResponse(str(dist_path / "index.html"))
-else:
-    print(f"Warning: dist folder not found at {dist_path}")
-
 
 
 if __name__ == "__main__":
