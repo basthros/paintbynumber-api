@@ -206,8 +206,8 @@ def encode_image_to_base64(img: np.ndarray, format: str = 'jpeg') -> str:
     return f"data:image/{format};base64,{img_base64}"
 
 
-@app.get("/")
-async def root():
+@app.get("/api/health")
+async def health_check():
     """Health check endpoint."""
     return {
         "status": "online",
