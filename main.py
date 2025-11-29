@@ -216,7 +216,7 @@ async def health_check():
     }
 
 
-@app.post("/generate")
+@app.post("/api/generate")
 async def generate_paint_by_number(
     file: UploadFile = File(...),
     palette: str = Form(...),
